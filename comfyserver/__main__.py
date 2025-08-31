@@ -1,15 +1,17 @@
 import argparse
-import kserve
 import asyncio
 import sys
+
+import kserve
 from kserve import logging
 from kserve.errors import ModelMissingError
 from kserve.logging import logger
-from .kutils import FileHandler
 
+from .kutils import FileHandler, load_extra_path_config
+from .model import ComfyModel
 from .model_repository import ConfyModelRepository
 
-# TODO add WF as annotiation
+
 parser = argparse.ArgumentParser(parents=[kserve.model_server.parser])
 parser.add_argument(
     "--workflow",
@@ -95,18 +97,10 @@ def disable_save_nodes(node_class_mapping: dict):
             setattr(node_class, "INPUT_TYPES", INPUT_TYPES)
             # setattr(node_class, "RETURN_TYPES", "IGNORE")
 
-
 def override_load_image_nodes(node_class_mapping: dict):
     from .overridden_nodes import LoadImage, LoadImageMask
     node_class_mapping["LoadImage"] = LoadImage
     node_class_mapping["LoadImageMask"] = LoadImageMask
-
-
-async def init_extra_nodes(
-    intit_custom_nodes: bool = False, init_api_nodes: bool = False
-):
-    from nodes import init_extra_nodes
-    await init_extra_nodes(intit_custom_nodes, init_api_nodes)
 
 
 if __name__ == "__main__":
@@ -116,26 +110,24 @@ if __name__ == "__main__":
         
     # TODO fix this cause the pyton path is also set
     sys.path.insert(0, args.comfyui_path)
-    
     from nodes import NODE_CLASS_MAPPINGS
-
-    from .kutils import load_extra_path_config
 
     # TODO error handling
     # TODO add extra flags for custom nodes paths or handle them here
     load_extra_path_config(args.models_path_config)
 
     if args.override_prompt_server:
-        from .kutils import DummyObject
         import server
+        from .kutils import DummyObject
         server.PromptServer = DummyObject
 
     # Initialize the event loop for loading builtin extra nodes
     if args.enable_extra_builtin_nodes:
+        from nodes import init_extra_nodes
         loop = asyncio.new_event_loop()
         loop.run_until_complete(
             init_extra_nodes(
-                intit_custom_nodes=args.enable_custom_nodes,
+                init_custom_nodes=args.enable_custom_nodes,
                 init_api_nodes=args.enable_api_nodes,
             )
         )
@@ -147,29 +139,21 @@ if __name__ == "__main__":
         override_load_image_nodes(NODE_CLASS_MAPPINGS)
     
     
-
-    
-    
     try:
-        # chekc if workflow is a file or a directory
+        # Check if workflow is a file or a directory
         if args.workflow.endswith(".json"):
             workflow = FileHandler.read_json_file(args.workflow)
         else:
             raise ModelMissingError(args.workflow)
             
-        from comfyserver import ComfyModel
         model = ComfyModel(args.model_name, workflow)
         model.load()
         kserve.ModelServer().start([model])
-        # model_server = kserve.ModelServer()
-        # model.load(model_server)
-        # dummy_model = kserve.Model(name="dummy")
-        # dummy_model.load()
-        # model_server.start([dummy_model])
+
 
     except ModelMissingError:
-        logger.error(
-            f"failed to locate workflow file for model {args.model_name} under dir {args.workflow},"
+        logger.info(
+            f"No workflow .json file for model {args.model_name} under dir {args.workflow} detected,"
             f"trying loading from model repository."
         )
         # TODO Model mesh section
@@ -177,7 +161,10 @@ if __name__ == "__main__":
         # Case 2: In the event that the model repository is empty, it's possible that this is a scenario for
         # multi-model serving. In such a case, models are loaded dynamically using the TrainedModel.
         # Therefore, we start the server without any preloaded models
-        kserve.ModelServer()
+        # TODO read about TrainedModel
         kserve.ModelServer(
             registered_models=ConfyModelRepository(args.workflow)
         ).start([])
+    except Exception as e:
+        logger.error(f"Failed to start the model server: {str(e)}")
+        raise e

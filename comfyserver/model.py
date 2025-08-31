@@ -1,115 +1,18 @@
+import asyncio
+import gc
 import inspect
 import random
-from typing import Dict, List, Any, Callable, Tuple, Dict, Union
-import torch
-import gc
-from .kutils import get_value_at_index
-from nodes import NODE_CLASS_MAPPINGS
+from typing import Any, Callable, Dict, List, Tuple, Union
 
 import numpy as np
-from .api_mapper import InputOutputParser
-from .api_mapper import convert_infer_input_to_comfyui
-
-from kserve.protocol.infer_type import InferRequest, InferResponse,InferOutput,InferInput
+import torch
 from kserve import Model
-
 from kserve.errors import InvalidInput
+from kserve.protocol.infer_type import InferRequest, InferResponse
+from nodes import NODE_CLASS_MAPPINGS
 
-import asyncio
-from threading import Thread
-
-
-class LoadOrderDeterminer:
-    """Determine the load order of each key in the provided dictionary.
-
-    This class places the nodes without node dependencies first, then ensures that any node whose
-    result is used in another node will be added to the list in the order it should be executed.
-
-    Attributes:
-        data (Dict): The dictionary for which to determine the load order.
-        node_class_mappings (Dict): Mappings of node classes.
-    """
-    _LOADER_CATEGORIES = ["loaders", "advanced/loaders"]
-
-    def __init__(self, data: Dict, node_class_mappings: Dict):
-        """Initialize the LoadOrderDeterminer with the given data and node class mappings.
-
-        Args:
-            data (Dict): The dictionary for which to determine the load order.
-            node_class_mappings (Dict): Mappings of node classes.
-        """
-        self.data = data
-        NODE_CLASS_MAPPINGS = node_class_mappings
-        self.visited = {}
-        self.load_order = []
-        self.is_special_function = False
-
-    def determine_load_order(self) -> List[Tuple[str, Dict, bool]]:
-        """Determine the load order for the given data.
-
-        Returns:
-            List[Tuple[str, Dict, bool]]: A list of tuples representing the load order.
-        """
-        init_order, runtime_order = [], []
-
-        # visit in topological order (same DFS you already have)
-        self._load_special_functions_first()  # ensures loader nodes visited first
-        self.is_special_function = False
-
-        for key in self.data:
-            if key not in self.visited:
-                self._dfs(key)
-
-        # ➊  split while preserving relative order
-        for entry in self.load_order:
-            _key, node_dict, _ = entry
-            cls = NODE_CLASS_MAPPINGS[node_dict["class_type"]]()
-            (init_order if cls.CATEGORY in self._LOADER_CATEGORIES else runtime_order).append(entry)
-
-        return init_order, runtime_order, self.load_order
-
-    def _dfs(self, key: str) -> None:
-        """Depth-First Search function to determine the load order.
-
-        Args:
-            key (str): The key from which to start the DFS.
-
-        Returns:
-            None
-        """
-        # Mark the node as visited.
-        self.visited[key] = True
-        inputs = self.data[key]["inputs"]
-        # Loop over each input key.
-        for input_key, val in inputs.items():
-            # If the value is a list and the first item in the list has not been visited yet,
-            # then recursively apply DFS on the dependency.
-            if isinstance(val, list) and val[0] not in self.visited:
-                self._dfs(val[0])
-        # Add the key and its corresponding data to the load order list.
-        self.load_order.append((key, self.data[key], self.is_special_function))
-
-    def _load_special_functions_first(self) -> None:
-        """Load functions without dependencies, loaderes, and encoders first.
-
-        Returns:
-            None
-        """
-        # Iterate over each key in the data to check for loader keys.
-        for key in self.data:
-            class_def = NODE_CLASS_MAPPINGS[self.data[key]["class_type"]]()
-            # Check if the class is a loader class or meets specific conditions.
-            if (
-                class_def.CATEGORY == "loaders"
-                or class_def.FUNCTION in ["encode"]
-                or not any(
-                    isinstance(val, list) for val in self.data[key]["inputs"].values()
-                )
-            ):
-                self.is_special_function = True
-                # If the key has not been visited, perform a DFS from that key.
-                if key not in self.visited:
-                    self._dfs(key)
+from .adaptor import ComfyKserveMapper
+from .kutils import LoadOrderDeterminer, get_value_at_index
 
 
 class ComfyModel(Model):
@@ -118,17 +21,22 @@ class ComfyModel(Model):
     def __init__(self, name: str, workflow: Dict):
         super().__init__(name)
         self.name = name
+        # TODO add metadata dict to workflow and extract it herer
         self.workflow = workflow
         self.ready = False
-        self._loading = False
+
         self._loader_outputs: dict[str, Any] = {}  # <- cached results
         self.gpu_semaphore = asyncio.Semaphore()
 
         load_order_determiner = LoadOrderDeterminer(workflow, NODE_CLASS_MAPPINGS)
         self.orders = load_order_determiner.determine_load_order()
 
-        api_parser = InputOutputParser()
-        self.infer_inputs, self.infer_outputs = api_parser.parse_api_data(self.workflow)
+        # Map workflow to inference inputs and outputs
+        self.infer_inputs, self.infer_outputs = (
+            ComfyKserveMapper.convert_workflow_to_inference_objects(self.workflow)
+        )
+
+        # Save input and output names for quick validation
         self.input_names = [inp.name for inp in self.infer_inputs]
         self.output_names = [out.name for out in self.infer_outputs]
 
@@ -138,39 +46,15 @@ class ComfyModel(Model):
     async def get_output_types(self) -> List[Dict]:
         return [output_inf.to_dict() for output_inf in self.infer_outputs]
 
-    # def load(self,model_server) -> bool:
-    #     """Non-blocking load that starts background loading"""
-    #     if not self._loading:
-    #         self._loading = True
-    #         self.model_server = model_server 
-    #         # Start loading in background thread
-    #         loading_thread = Thread(target=self._load, daemon=True)
-    #         loading_thread.start()
-    #     return True  # Return immediately
-    
-    # def load(self):
-    #     """Called by KServe during startup - don't block here"""
-    #     # Start async loading task but don't wait for it
-    #     self.loading_task = asyncio.create_task(self._async_load())
-    #     # Set ready to False initially
-    #     self.ready = False
-        
-
-    
-    # def _load_model_sync(self):
-    #     pass      
-    
-    
     def stop(self):
         super().stop()
-        self._loader_outputs  = {}
+        self._loader_outputs = {}
         gc.collect()
 
         if torch.cuda.is_available():
             torch.cuda.empty_cache()
             torch.cuda.ipc_collect()
             torch.cuda.synchronize()
-
 
     def load(self) -> bool:
         "Execute all loader nodes exactly once and cache their results."
@@ -184,38 +68,41 @@ class ComfyModel(Model):
         with torch.no_grad():
             for idx, data, _ in init_order:
                 cache_dict[idx] = {}
-                
+
                 cls_name = data["class_type"]
                 cache_dict[idx]["class_type"] = cls_name
 
                 # prepare inputs (nothing references loaders, so direct literals)
                 inputs = self._process_inputs(data["inputs"], self._loader_outputs)
                 cache_dict[idx]["inputs"] = inputs
-                
+
                 # instantiate (once per class)
                 if cls_name not in initialized_objects:
                     initialized_objects[cls_name] = NODE_CLASS_MAPPINGS[cls_name]()
-                
+
                 obj = initialized_objects[cls_name]
-                
+
                 # TODO rewrite the caching logic to be more readable
                 output = None
                 for node_id, node_config in cache_dict.items():
                     if node_id == idx:
                         continue
-                    if node_config["class_type"] == cls_name and node_config["inputs"] == inputs:
+                    if (
+                        node_config["class_type"] == cls_name
+                        and node_config["inputs"] == inputs
+                    ):
                         print(
                             f"[INIT] Reusing loader {node_id} ({cls_name}) for {idx} with same inputs {inputs}"
                         )
                         output = self._loader_outputs[node_id]
                         break
-                    
+
                 if not output:
                     print(
-                    f"[INIT] Executed loader {idx} ({cls_name}) whith these inputs {inputs}"
-                )
+                        f"[INIT] Executed loader {idx} ({cls_name}) whith these inputs {inputs}"
+                    )
                     output = getattr(obj, obj.FUNCTION)(**inputs)
-                    
+
                 # run and cache
                 self._loader_outputs[idx] = output
                 # print(
@@ -260,6 +147,7 @@ class ComfyModel(Model):
         Returns:
             A Dict or InferResponse after post-process to return back to the client.
         """
+        # TODO inplement output name relabeling here based on parameters in InferResponse comming from InferRequest in predict
         return result
 
     async def predict(
@@ -279,6 +167,7 @@ class ComfyModel(Model):
                 raise
             finally:
                 # Always cleanup GPU memory
+                # TODO: research if this is really necessary here or if it can be done better
                 gc.collect()
                 if torch.cuda.is_available():
                     torch.cuda.empty_cache()
@@ -330,7 +219,9 @@ class ComfyModel(Model):
 
                     # Initialize the class if not already done
                     if class_type not in initialized_objects:
-                        initialized_objects[class_type] = NODE_CLASS_MAPPINGS[class_type]()
+                        initialized_objects[class_type] = NODE_CLASS_MAPPINGS[
+                            class_type
+                        ]()
                         print(f"Initialized {class_type}")
 
                     class_instance = initialized_objects[class_type]
@@ -353,14 +244,19 @@ class ComfyModel(Model):
                                 processed_inputs[key] = value
                         # TODO insert input replacement logic here
                         # TODO check for data type and convert if necessary
-                        elif user_input:= payload.get_input_by_name(InputOutputParser.INFER_INPUT_NAME_TEMPLATE.format(
-                            node_id=idx,
-                            input_name=key
-                        )):
+                        elif user_input := payload.get_input_by_name(
+                            ComfyKserveMapper.INFER_INPUT_NAME_TEMPLATE.format(
+                                node_id=idx, input_name=key
+                            )
+                        ):
 
-                            processed_inputs[key] = convert_infer_input_to_comfyui(user_input) 
+                            processed_inputs[key] = (
+                                ComfyKserveMapper.convert_inferInput_to_comfy(
+                                    user_input
+                                )
+                            )
                             # processed_inputs[key] = user_input.data
-                            
+
                         elif key in ["noise_seed", "seed"]:
                             # Generate random seed
                             processed_inputs[key] = random.randint(1, 2**64)
@@ -406,27 +302,21 @@ class ComfyModel(Model):
                         print(f"Error executing node {idx} ({class_type}): {str(e)}")
                         current_results[idx] = None
 
-                # Create response outputs with actual data
-            response_outputs = self.create_infer_outputs_for_response(current_results, payload)
-        
+            # Create response outputs with actual data
+            response_outputs = ComfyKserveMapper.generate_inference_response_outputs(
+                node_results=current_results,
+                infer_request=payload,
+                infer_outputs=self.infer_outputs,
+            )
 
-    # TODO Cleen this part
-        # gc.collect()
-
-        # if torch.cuda.is_available():
-        #     torch.cuda.empty_cache()
-        #     torch.cuda.ipc_collect()
-        #     torch.cuda.synchronize()
-            
-        
         return InferResponse(
-            response_id=payload.id,
+            response_id=str(payload.id),
             model_name=self.name,
             infer_outputs=response_outputs,
             parameters={"execution_successful": True},
         )
 
-    def _process_inputs(self,inputs: Dict, executed_variables: Dict) -> Dict:
+    def _process_inputs(self, inputs: Dict, executed_variables: Dict) -> Dict:
         """Process inputs, replacing references with actual values."""
         # TODO add a part which replaces the inputs form incumming request mabe in pre-predict
         processed_inputs = {}
@@ -470,172 +360,3 @@ class ComfyModel(Model):
             return list(parameters.keys()) if not catch_all else None
         except:
             return None
-    
-    def create_infer_outputs_for_response(self, current_results: Dict, payload: InferRequest) -> List[InferOutput]:
-        """
-        Create InferOutput objects with actual data for the prediction response.
-        Uses the shape and type specifications from self.infer_outputs but populates with actual results.
-        
-        Args:
-            current_results: Dictionary containing the execution results from workflow nodes
-            payload: The original request payload to check which outputs are requested
-            
-        Returns:
-            List of InferOutput objects with actual data matching the expected specifications
-        """
-        response_outputs = []
-        
-        # Get requested outputs from payload, or use all if none specified
-        requested_output_names = []
-        if payload.request_outputs:
-            requested_output_names = [req_out.name for req_out in payload.request_outputs]
-        else:
-            return response_outputs
-            requested_output_names = [out.name for out in self.infer_outputs]
-        
-        for output_spec in self.infer_outputs:
-            # Skip if this output wasn't requested
-            if output_spec.name not in requested_output_names:
-                continue
-
-            node_id, output_index, output_type = output_spec.name.split("_", 2)
-            # TODO add two options for specifying output nme 
-
-            # node_id = output_spec.parameters.get("node_id")
-            # output_index = output_spec.parameters.get("output_index")
-            # output_type = output_spec.parameters.get("output_type")
-            
-            if node_id is None or output_index is None or output_type is None:
-                continue
-                
-
-            # Get the actual result data from workflow execution
-            if node_id in current_results and current_results[node_id] is not None:
-                result_data = get_value_at_index(current_results[node_id], int(output_index))
-                
-                # Convert the result data to the appropriate format for KServe
-                converted_data = self._convert_comfyui_output_to_kserve(result_data, output_type, output_spec.shape)
-                
-                # Create new InferOutput with actual data
-                response_output = InferOutput(
-                    name=output_spec.name,
-                    shape=list(converted_data.shape) if hasattr(converted_data, 'shape') else output_spec.shape,
-                    datatype=output_spec.datatype,
-                    parameters=output_spec.parameters
-                )
-                
-                # Set the actual data
-                # response_output.data = converted_data.tolist() if hasattr(converted_data, 'tolist') else [converted_data]
-                response_output.data = converted_data
-                response_outputs.append(response_output)
-        
-        return response_outputs
-
-    # def _convert_comfyui_output_to_kserve(self, data: Any, output_type: str, expected_shape: List[int]) -> Any:
-    #     """
-    #     Convert ComfyUI output data to KServe-compatible format.
-        
-    #     Args:
-    #         data: Raw output data from ComfyUI node execution
-    #         output_type: The expected output type
-    #         expected_shape: The expected shape for the output
-            
-    #     Returns:
-    #         Converted data in appropriate format
-    #     """
-    #     # Handle different output types
-    #     if output_type in ["IMAGE", "MASK", "LATENT", "VIDEO", "NOISE"]:
-    #         # Convert tensor-like data to numpy arrays
-    #         if hasattr(data, 'cpu'):  # PyTorch tensor
-    #             return data.cpu().numpy()
-    #         elif hasattr(data, 'numpy'):  # Other tensor types
-    #             return data.numpy()
-    #         elif isinstance(data, np.ndarray):
-    #             return data
-    #         else:
-    #             return np.array(data)
-                
-    #     elif output_type in ["STRING"]:
-    #         # Convert to bytes for BYTES datatype
-    #         if isinstance(data, str):
-    #             return data.encode('utf-8')
-    #         return str(data).encode('utf-8')
-            
-    #     elif output_type in ["INT", "FLOAT", "NUMBER", "BOOLEAN"]:
-    #         # Scalar values
-    #         return np.array([data])
-            
-    #     elif output_type in ["POINT", "BBOX"]:
-    #         # Convert to numpy array
-    #         return np.array(data)
-            
-    #     else:
-    #         # Default: try to convert to numpy array or return as-is
-    #         try:
-    #             return np.array(data)
-    #         except:
-    #             return data
-    def _convert_comfyui_output_to_kserve(self, data: Any, output_type: str, expected_shape: List[int]) -> Any:
-        # TODO compare with other implemetation
-        
-        """
-        Convert ComfyUI output data to KServe-compatible format with CPU tensors.
-        
-        Args:
-            data: Raw output data from ComfyUI node execution
-            output_type: The expected output type
-            expected_shape: The expected shape for the output
-            
-        Returns:
-            Converted data in appropriate format (all tensors moved to CPU)
-        """
-        
-        # Helper function to recursively move tensors to CPU and detach from computation graph
-        def to_cpu(obj):
-            if hasattr(obj, 'is_cuda') and obj.is_cuda:  # PyTorch tensor on GPU
-                return obj.detach().to("cpu", non_blocking=False).contiguous()
-            elif hasattr(obj, 'cpu'):  # Any tensor with .cpu() method
-                return obj.cpu().detach() if hasattr(obj, 'detach') else obj.cpu()
-            elif isinstance(obj, (list, tuple)):
-                return type(obj)(to_cpu(x) for x in obj)
-            elif isinstance(obj, dict):
-                return {k: to_cpu(v) for k, v in obj.items()}
-            return obj
-        
-        # Convert input data to CPU first - this is the key addition
-        data = to_cpu(data)
-        
-        # Handle different output types (same logic as before, but now working with CPU data)
-        if output_type in ["IMAGE", "MASK", "LATENT", "VIDEO", "NOISE"]:
-            # Convert tensor-like data to numpy arrays
-            if hasattr(data, 'cpu'):  # PyTorch tensor (should now be on CPU)
-                return data.cpu().numpy()
-            elif hasattr(data, 'numpy'):  # Other tensor types
-                return data.numpy()
-            elif isinstance(data, np.ndarray):
-                return data
-            else:
-                return np.array(data)
-                
-        elif output_type in ["STRING"]:
-            # Convert to bytes for BYTES datatype
-            if isinstance(data, str):
-                return data.encode('utf-8')
-            return str(data).encode('utf-8')
-            
-        elif output_type in ["INT", "FLOAT", "NUMBER", "BOOLEAN"]:
-            # Scalar values
-            return np.array([data])
-            
-        elif output_type in ["POINT", "BBOX"]:
-            # Convert to numpy array
-            return np.array(data)
-            
-        else:
-            # Default: try to convert to numpy array or return as-is
-            try:
-                return np.array(data)
-            except:
-                return data
-
-

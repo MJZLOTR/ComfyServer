@@ -1,11 +1,11 @@
-import os
-from typing import Sequence, Mapping, Any, Union,TextIO
-import sys
 import json
-
-import yaml
-import folder_paths
 import logging
+import os
+from typing import Any, Dict, List, Mapping, Sequence, TextIO, Tuple, Union
+
+import folder_paths
+import yaml
+
 
 def load_extra_path_config(yaml_path):
     with open(yaml_path, 'r', encoding='utf-8') as stream:
@@ -44,116 +44,6 @@ def load_extra_path_config(yaml_path):
                 normalized_path = os.path.normpath(full_path)
                 logging.info("Adding extra search path {} {}".format(x, normalized_path))
                 folder_paths.add_model_folder_path(x, normalized_path, is_default)
-                
-        
-
-
-class FileHandler:
-    """Handles reading and writing files.
-
-    This class provides methods to read JSON data from an input file and write code to an output file.
-    """
-
-    @staticmethod
-    def read_json_file(file_path: str | TextIO, encoding: str = "utf-8") -> dict:
-        """
-        Reads a JSON file and returns its contents as a dictionary.
-
-        Args:
-            file_path (str): The path to the JSON file.
-
-        Returns:
-            dict: The contents of the JSON file as a dictionary.
-
-        Raises:
-            FileNotFoundError: If the file is not found, it lists all JSON files in the directory of the file path.
-            ValueError: If the file is not a valid JSON.
-        """
-
-        if hasattr(file_path, "read"):
-            return json.load(file_path)
-        with open(file_path, "r", encoding="utf-8") as file:
-            data = json.load(file)
-        return data
-
-def import_custom_nodes() -> None:
-    """Find all custom nodes in the custom_nodes folder and add those node objects to NODE_CLASS_MAPPINGS
-
-    This function sets up a new asyncio event loop, initializes the PromptServer,
-    creates a PromptQueue, and initializes the custom nodes.
-    """
-    import asyncio
-    import execution
-    from nodes import init_extra_nodes
-    import server
-
-    # Creating a new event loop and setting it as the default loop
-    loop = asyncio.new_event_loop()
-    asyncio.set_event_loop(loop)
-
-    # Creating an instance of PromptServer with the loop
-    server_instance = server.PromptServer(loop)
-    execution.PromptQueue(server_instance)
-
-    # Initializing custom nodes
-    init_extra_nodes()
-
-
-def find_path(name: str, path: str = None) -> str:
-    """
-    Recursively looks at parent folders starting from the given path until it finds the given name.
-    Returns the path as a Path object if found, or None otherwise.
-    """
-    # If no path is given, use the current working directory
-    if path is None:
-        path = os.getcwd()
-
-    # Check if the current directory contains the name
-    if name in os.listdir(path):
-        path_name = os.path.join(path, name)
-        print(f"{name} found: {path_name}")
-        return path_name
-
-    # Get the parent directory
-    parent_directory = os.path.dirname(path)
-
-    # If the parent directory is the same as the current directory, we've reached the root and stop the search
-    if parent_directory == path:
-        return None
-
-    # Recursively call the function with the parent directory
-    return find_path(name, parent_directory)
-
-
-def add_comfyui_directory_to_sys_path() -> None:
-    """
-    Add 'ComfyUI' to the sys.path
-    """
-    comfyui_path = find_path("ComfyUI")
-    if comfyui_path is not None and os.path.isdir(comfyui_path):
-        sys.path.append(comfyui_path)
-        print(f"'{comfyui_path}' added to sys.path")
-
-
-def add_extra_model_paths() -> None:
-    """
-    Parse the optional extra_model_paths.yaml file and add the parsed paths to the sys.path.
-    """
-    try:
-        from main import load_extra_path_config
-    except ImportError:
-        print(
-            "Could not import load_extra_path_config from main.py. Looking in utils.extra_config instead."
-        )
-        from utils.extra_config import load_extra_path_config
-
-    extra_model_paths = find_path("extra_model_paths.yaml")
-
-    if extra_model_paths is not None:
-        load_extra_path_config(extra_model_paths)
-    else:
-        print("Could not find the extra_model_paths config file.")
-
 
 def get_value_at_index(obj: Union[Sequence, Mapping], index: int) -> Any:
     """Returns the value at the given index of a sequence or mapping.
@@ -177,7 +67,6 @@ def get_value_at_index(obj: Union[Sequence, Mapping], index: int) -> Any:
         return obj[index]
     except KeyError:
         return obj["result"][index]
-
 
 class DummyMeta(type):
     def __getattr__(cls, name):
@@ -209,3 +98,124 @@ class DummyObject(metaclass=DummyMeta):
     def __iter__(self):
         # Handle iteration
         return iter([])
+
+class FileHandler:
+
+    """Handles reading and writing files.
+
+    This class provides methods to read JSON data from an input file and write code to an output file.
+    """
+
+    @staticmethod
+    def read_json_file(file_path: str | TextIO, encoding: str = "utf-8") -> dict:
+        """
+        Reads a JSON file and returns its contents as a dictionary.
+
+        Args:
+            file_path (str): The path to the JSON file.
+
+        Returns:
+            dict: The contents of the JSON file as a dictionary.
+
+        Raises:
+            FileNotFoundError: If the file is not found, it lists all JSON files in the directory of the file path.
+            ValueError: If the file is not a valid JSON.
+        """
+
+        if hasattr(file_path, "read"):
+            return json.load(file_path)
+        with open(file_path, "r", encoding="utf-8") as file:
+            data = json.load(file)
+        return data
+    
+class LoadOrderDeterminer:
+    """Determine the load order of each key in the provided dictionary.
+
+    This class places the nodes without node dependencies first, then ensures that any node whose
+    result is used in another node will be added to the list in the order it should be executed.
+
+    Attributes:
+        data (Dict): The dictionary for which to determine the load order.
+        node_class_mappings (Dict): Mappings of node classes.
+    """
+    _LOADER_CATEGORIES = ["loaders", "advanced/loaders"]
+
+    def __init__(self, data: Dict, node_class_mappings: Dict):
+        """Initialize the LoadOrderDeterminer with the given data and node class mappings.
+
+        Args:
+            data (Dict): The dictionary for which to determine the load order.
+            node_class_mappings (Dict): Mappings of node classes.
+        """
+        self.data = data
+        self.node_class_mappings = node_class_mappings
+        self.visited = {}
+        self.load_order = []
+        self.is_special_function = False
+
+    def determine_load_order(self) -> List[Tuple[str, Dict, bool]]:
+        """Determine the load order for the given data.
+
+        Returns:
+            List[Tuple[str, Dict, bool]]: A list of tuples representing the load order.
+        """
+        init_order, runtime_order = [], []
+
+        # visit in topological order (same DFS you already have)
+        self._load_special_functions_first()  # ensures loader nodes visited first
+        self.is_special_function = False
+
+        for key in self.data:
+            if key not in self.visited:
+                self._dfs(key)
+
+        # ➊  split while preserving relative order
+        for entry in self.load_order:
+            _key, node_dict, _ = entry
+            cls = self.node_class_mappings[node_dict["class_type"]]()
+            (init_order if cls.CATEGORY in self._LOADER_CATEGORIES else runtime_order).append(entry)
+
+        return init_order, runtime_order, self.load_order
+
+    def _dfs(self, key: str) -> None:
+        """Depth-First Search function to determine the load order.
+
+        Args:
+            key (str): The key from which to start the DFS.
+
+        Returns:
+            None
+        """
+        # Mark the node as visited.
+        self.visited[key] = True
+        inputs = self.data[key]["inputs"]
+        # Loop over each input key.
+        for input_key, val in inputs.items():
+            # If the value is a list and the first item in the list has not been visited yet,
+            # then recursively apply DFS on the dependency.
+            if isinstance(val, list) and val[0] not in self.visited:
+                self._dfs(val[0])
+        # Add the key and its corresponding data to the load order list.
+        self.load_order.append((key, self.data[key], self.is_special_function))
+
+    def _load_special_functions_first(self) -> None:
+        """Load functions without dependencies, loaderes, and encoders first.
+
+        Returns:
+            None
+        """
+        # Iterate over each key in the data to check for loader keys.
+        for key in self.data:
+            class_def = self.node_class_mappings[self.data[key]["class_type"]]()
+            # Check if the class is a loader class or meets specific conditions.
+            if (
+                class_def.CATEGORY == "loaders"
+                or class_def.FUNCTION in ["encode"]
+                or not any(
+                    isinstance(val, list) for val in self.data[key]["inputs"].values()
+                )
+            ):
+                self.is_special_function = True
+                # If the key has not been visited, perform a DFS from that key.
+                if key not in self.visited:
+                    self._dfs(key)

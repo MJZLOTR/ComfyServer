@@ -1,12 +1,12 @@
+import asyncio
 import os
 import threading
-from kserve.model_repository import ModelRepository, MODEL_MOUNT_DIRS
-from .model import ComfyModel
 from typing import Dict, Optional
-from kserve.model import BaseKServeModel
-from .model import ComfyModel
+
+from kserve.model_repository import ModelRepository
+
 from .kutils import FileHandler
-import asyncio
+from .model import ComfyModel
 
 
 class ConfyModelRepository(ModelRepository):

@@ -1,10 +1,8 @@
 
 
-from PIL import Image, ImageOps, ImageSequence
-import node_helpers
-import numpy as np
-import torch
 import nodes
+import torch
+
 
 class LoadImage:
     @classmethod
@@ -34,17 +32,6 @@ class LoadImage:
         # Get dimensions
         batch_size, h, w, channels = image.shape
         
-        # The input should already be in RGB format and normalized [0,1]
-        # No need for additional processing like EXIF transpose or format conversion
-        
-        # Create default mask since we don't have alpha channel information
-        # Create a mask of ones (fully opaque) with the same batch size and spatial dimensions
-        # mask = torch.ones((batch_size, h, w), dtype=torch.float32, device=image.device)
-        
-        # # Return the image and mask
-        # # Image shape: (batch, height, width, channels)
-        # # Mask shape: (batch, height, width)
-        # return (image, mask)
         if channels == 4:
             # RGBA image - extract RGB and use alpha as mask
             rgb_image = image[:, :, :, :3]
@@ -72,31 +59,68 @@ class LoadImage:
 
 class LoadImageMask:
     _color_channels = ["alpha", "red", "green", "blue"]
+    
     @classmethod
-    def INPUT_TYPES(s):
-        return {"required":
-                    {"image": ("IMAGE",),
-                     "channel": (s._color_channels, ), }
-                }
+    def INPUT_TYPES(cls):
+        return {"required": {
+            "image": "IMAGE",
+            "channel": (cls._color_channels, )
+        }}
 
     CATEGORY = "mask"
 
     RETURN_TYPES = ("MASK",)
     FUNCTION = "load_image"
+    
     def load_image(self, image, channel):
-        i = node_helpers.pillow(ImageOps.exif_transpose, image)
-        if i.getbands() != ("R", "G", "B", "A"):
-            if i.mode == 'I':
-                i = i.point(lambda i: i * (1 / 255))
-            i = i.convert("RGBA")
-        mask = None
-        c = channel[0].upper()
-        if c in i.getbands():
-            mask = np.array(i.getchannel(c)).astype(np.float32) / 255.0
-            mask = torch.from_numpy(mask)
-            if c == 'A':
-                mask = 1. - mask
+        # TODO test this function
+        if isinstance(image, str):
+            return nodes.LoadImageMask().load_image(image, channel)
+            
+        # Input image is already a tensor with shape (batch, height, width, channels)
+        # and values normalized to [0,1] range
+        
+        # Ensure the image is a torch tensor
+        if not isinstance(image, torch.Tensor):
+            image = torch.from_numpy(image).float()
+        
+        # Ensure the tensor is float32
+        if image.dtype != torch.float32:
+            image = image.float()
+        
+        # Get dimensions
+        batch_size, h, w, channels = image.shape
+        
+        # Map channel names to indices
+        channel_map = {
+            "red": 0,
+            "green": 1, 
+            "blue": 2,
+            "alpha": 3
+        }
+        
+        c = channel[0].lower()
+        
+        if c == "alpha" and channels >= 4:
+            # Extract alpha channel and invert it (following original pattern)
+            mask = image[:, :, :, 3]
+            mask = 1.0 - mask  # Invert alpha like in original code
+        elif c in ["red", "green", "blue"] and channels >= 3:
+            # Extract the specified color channel
+            channel_idx = channel_map[c]
+            if channel_idx < channels:
+                mask = image[:, :, :, channel_idx]
+            else:
+                # Channel doesn't exist, create default mask
+                mask = torch.zeros((batch_size, h, w), dtype=torch.float32, device=image.device)
         else:
-            mask = torch.zeros((64,64), dtype=torch.float32, device="cpu")
-        return (mask.unsqueeze(0),)
+            # Channel doesn't exist or unsupported, create default mask
+            mask = torch.zeros((batch_size, h, w), dtype=torch.float32, device=image.device)
+        
+        # Ensure mask is proper type and shape
+        mask = mask.float()
+        
+        # Return the mask
+        # Mask shape: (batch, height, width)
+        return (mask,)
 
