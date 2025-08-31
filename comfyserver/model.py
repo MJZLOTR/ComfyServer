@@ -115,13 +115,14 @@ class LoadOrderDeterminer:
 class ComfyModel(Model):
     """Executes a workflow directly instead of generating code."""
 
-    def __init__(self, name: str, workflow: str):
+    def __init__(self, name: str, workflow: Dict):
         super().__init__(name)
         self.name = name
         self.workflow = workflow
         self.ready = False
         self._loading = False
         self._loader_outputs: dict[str, Any] = {}  # <- cached results
+        self.gpu_semaphore = asyncio.Semaphore()
 
         load_order_determiner = LoadOrderDeterminer(workflow, NODE_CLASS_MAPPINGS)
         self.orders = load_order_determiner.determine_load_order()
@@ -137,16 +138,40 @@ class ComfyModel(Model):
     async def get_output_types(self) -> List[Dict]:
         return [output_inf.to_dict() for output_inf in self.infer_outputs]
 
-    # def load(self) -> bool:
+    # def load(self,model_server) -> bool:
     #     """Non-blocking load that starts background loading"""
     #     if not self._loading:
     #         self._loading = True
+    #         self.model_server = model_server 
     #         # Start loading in background thread
-    #         loading_thread = Thread(target=self._load_models, daemon=True)
+    #         loading_thread = Thread(target=self._load, daemon=True)
     #         loading_thread.start()
     #     return True  # Return immediately
     
+    # def load(self):
+    #     """Called by KServe during startup - don't block here"""
+    #     # Start async loading task but don't wait for it
+    #     self.loading_task = asyncio.create_task(self._async_load())
+    #     # Set ready to False initially
+    #     self.ready = False
         
+
+    
+    # def _load_model_sync(self):
+    #     pass      
+    
+    
+    def stop(self):
+        super().stop()
+        self._loader_outputs  = {}
+        gc.collect()
+
+        if torch.cuda.is_available():
+            torch.cuda.empty_cache()
+            torch.cuda.ipc_collect()
+            torch.cuda.synchronize()
+
+
     def load(self) -> bool:
         "Execute all loader nodes exactly once and cache their results."
         # TODO Must do model seperation into different
@@ -197,6 +222,8 @@ class ComfyModel(Model):
                 #     f"[INIT] Executed loader {idx} ({cls_name}) whith these inputs {inputs}"
                 # )
         self.ready = True
+        # self.model_server.register_model(self)
+        print(f"$$$$$$$$$ Models loaded and registered")
         return self.ready
 
     async def preprocess(
@@ -237,6 +264,29 @@ class ComfyModel(Model):
 
     async def predict(
         self, payload: InferRequest, headers: Dict[str, str] = None
+    ) -> Union[InferResponse, asyncio.Task]:
+        # return await asyncio.to_thread(self._infer, payload=payload, headers=headers)
+        # return await asyncio.create_task(
+        #         asyncio.to_thread(self._infer, payload=payload, headers=headers)
+        #     )
+        async with self.gpu_semaphore:
+            try:
+                return await asyncio.to_thread(
+                    self._infer, payload=payload, headers=headers
+                )
+            except Exception as e:
+                # logger.error(f"Inference failed: {str(e)}")
+                raise
+            finally:
+                # Always cleanup GPU memory
+                gc.collect()
+                if torch.cuda.is_available():
+                    torch.cuda.empty_cache()
+                    torch.cuda.ipc_collect()
+                    torch.cuda.synchronize()
+
+    def _infer(
+        self, payload: InferRequest, headers: Dict[str, str] = None
     ) -> InferResponse:
         """Execute the workflow directly and return results."""
 
@@ -248,124 +298,125 @@ class ComfyModel(Model):
         # Execute for the specified queue size
         print(f"Executing workflow")
         current_results = {}
+        device = torch.cuda.current_device()
+        with torch.cuda.device(device):
+            with torch.no_grad():
+                # Process each node in the load order
+                for idx, data, is_special_function in runtime_order:
+                    inputs, class_type = data["inputs"], data["class_type"]
+                    input_types = NODE_CLASS_MAPPINGS[class_type].INPUT_TYPES()
 
-        with torch.no_grad():
-            # Process each node in the load order
-            for idx, data, is_special_function in runtime_order:
-                inputs, class_type = data["inputs"], data["class_type"]
-                input_types = NODE_CLASS_MAPPINGS[class_type].INPUT_TYPES()
+                    # Check for missing required inputs
+                    missing_required_variable = False
+                    if "required" in input_types.keys():
+                        for required in input_types["required"]:
+                            if required not in inputs.keys():
+                                missing_required_variable = True
+                                break
 
-                # Check for missing required inputs
-                missing_required_variable = False
-                if "required" in input_types.keys():
-                    for required in input_types["required"]:
-                        if required not in inputs.keys():
-                            missing_required_variable = True
-                            break
+                    # prompt_input = prompt.get(idx,None)
+                    # prompt_input = prompt_input.get('inputs')
 
-                # prompt_input = prompt.get(idx,None)
-                # prompt_input = prompt_input.get('inputs')
+                    if missing_required_variable:
+                        print(
+                            f"Skipping node {idx} ({class_type}) - missing required inputs"
+                        )
+                        continue
 
-                if missing_required_variable:
-                    print(
-                        f"Skipping node {idx} ({class_type}) - missing required inputs"
-                    )
-                    continue
+                    # Skip preview image nodes
+                    if class_type == "PreviewImage":
+                        print(f"Skipping PreviewImage node {idx}")
+                        continue
 
-                # Skip preview image nodes
-                if class_type == "PreviewImage":
-                    print(f"Skipping PreviewImage node {idx}")
-                    continue
+                    # Initialize the class if not already done
+                    if class_type not in initialized_objects:
+                        initialized_objects[class_type] = NODE_CLASS_MAPPINGS[class_type]()
+                        print(f"Initialized {class_type}")
 
-                # Initialize the class if not already done
-                if class_type not in initialized_objects:
-                    initialized_objects[class_type] = NODE_CLASS_MAPPINGS[class_type]()
-                    print(f"Initialized {class_type}")
+                    class_instance = initialized_objects[class_type]
 
-                class_instance = initialized_objects[class_type]
+                    # Prepare inputs for execution
+                    processed_inputs = {}
+                    executed_variables = {**self._loader_outputs, **current_results}
+                    for key, value in inputs.items():
+                        if isinstance(value, list) and len(value) >= 2:
+                            # This is a reference to another node's output
+                            node_id, output_index = value[0], value[1]
+                            if node_id in executed_variables:
+                                processed_inputs[key] = get_value_at_index(
+                                    executed_variables[node_id], output_index
+                                )
+                            else:
+                                print(
+                                    f"Warning: Referenced node {node_id} not found in executed variables"
+                                )
+                                processed_inputs[key] = value
+                        # TODO insert input replacement logic here
+                        # TODO check for data type and convert if necessary
+                        elif user_input:= payload.get_input_by_name(InputOutputParser.INFER_INPUT_NAME_TEMPLATE.format(
+                            node_id=idx,
+                            input_name=key
+                        )):
 
-                # Prepare inputs for execution
-                processed_inputs = {}
-                executed_variables = {**self._loader_outputs, **current_results}
-                for key, value in inputs.items():
-                    if isinstance(value, list) and len(value) >= 2:
-                        # This is a reference to another node's output
-                        node_id, output_index = value[0], value[1]
-                        if node_id in executed_variables:
-                            processed_inputs[key] = get_value_at_index(
-                                executed_variables[node_id], output_index
-                            )
+                            processed_inputs[key] = convert_infer_input_to_comfyui(user_input) 
+                            # processed_inputs[key] = user_input.data
+                            
+                        elif key in ["noise_seed", "seed"]:
+                            # Generate random seed
+                            processed_inputs[key] = random.randint(1, 2**64)
                         else:
-                            print(
-                                f"Warning: Referenced node {node_id} not found in executed variables"
-                            )
                             processed_inputs[key] = value
-                    # TODO insert input replacement logic here
-                    # TODO check for data type and convert if necessary
-                    elif user_input:= payload.get_input_by_name(InputOutputParser.INFER_INPUT_NAME_TEMPLATE.format(
-                        node_id=idx,
-                        input_name=key
-                    )):
 
-                        processed_inputs[key] = convert_infer_input_to_comfyui(user_input) 
-                        # processed_inputs[key] = user_input.data
-                        
-                    elif key in ["noise_seed", "seed"]:
-                        # Generate random seed
-                        processed_inputs[key] = random.randint(1, 2**64)
-                    else:
-                        processed_inputs[key] = value
+                    # processed_inputs = self._process_inputs(idx,inputs,{**self._loader_outputs, **current_results})
 
-                # processed_inputs = self._process_inputs(idx,inputs,{**self._loader_outputs, **current_results})
-
-                # Add hidden variables if needed
-                if (
-                    "hidden" in input_types.keys()
-                    and "unique_id" in input_types["hidden"].keys()
-                ):
-                    processed_inputs["unique_id"] = random.randint(1, 2**64)
-                elif hasattr(class_instance, class_instance.FUNCTION):
-                    func_params = self._get_function_parameters(
-                        getattr(class_instance, class_instance.FUNCTION)
-                    )
-                    if func_params and "unique_id" in func_params:
+                    # Add hidden variables if needed
+                    if (
+                        "hidden" in input_types.keys()
+                        and "unique_id" in input_types["hidden"].keys()
+                    ):
                         processed_inputs["unique_id"] = random.randint(1, 2**64)
+                    elif hasattr(class_instance, class_instance.FUNCTION):
+                        func_params = self._get_function_parameters(
+                            getattr(class_instance, class_instance.FUNCTION)
+                        )
+                        if func_params and "unique_id" in func_params:
+                            processed_inputs["unique_id"] = random.randint(1, 2**64)
 
-                # Filter inputs to only include valid parameters
-                if hasattr(class_instance, class_instance.FUNCTION):
-                    func_params = self._get_function_parameters(
-                        getattr(class_instance, class_instance.FUNCTION)
-                    )
-                    if func_params is not None:
-                        processed_inputs = {
-                            key: value
-                            for key, value in processed_inputs.items()
-                            if key in func_params
-                        }
+                    # Filter inputs to only include valid parameters
+                    if hasattr(class_instance, class_instance.FUNCTION):
+                        func_params = self._get_function_parameters(
+                            getattr(class_instance, class_instance.FUNCTION)
+                        )
+                        if func_params is not None:
+                            processed_inputs = {
+                                key: value
+                                for key, value in processed_inputs.items()
+                                if key in func_params
+                            }
 
-                try:
-                    # Execute the function
-                    result = getattr(class_instance, class_instance.FUNCTION)(
-                        **processed_inputs
-                    )
-                    current_results[idx] = result
-                    print(f"Executed node {idx} ({class_type}) successfully")
+                    try:
+                        # Execute the function
+                        result = getattr(class_instance, class_instance.FUNCTION)(
+                            **processed_inputs
+                        )
+                        current_results[idx] = result
+                        print(f"Executed node {idx} ({class_type}) successfully")
 
-                except Exception as e:
-                    print(f"Error executing node {idx} ({class_type}): {str(e)}")
-                    current_results[idx] = None
+                    except Exception as e:
+                        print(f"Error executing node {idx} ({class_type}): {str(e)}")
+                        current_results[idx] = None
 
-            # Create response outputs with actual data
-        response_outputs = self.create_infer_outputs_for_response(current_results, payload)
+                # Create response outputs with actual data
+            response_outputs = self.create_infer_outputs_for_response(current_results, payload)
         
 
     # TODO Cleen this part
-        gc.collect()
+        # gc.collect()
 
-        if torch.cuda.is_available():
-                torch.cuda.empty_cache()
-                torch.cuda.ipc_collect()
-                torch.cuda.synchronize()
+        # if torch.cuda.is_available():
+        #     torch.cuda.empty_cache()
+        #     torch.cuda.ipc_collect()
+        #     torch.cuda.synchronize()
             
         
         return InferResponse(

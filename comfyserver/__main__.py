@@ -7,6 +7,7 @@ from kserve.errors import ModelMissingError
 from kserve.logging import logger
 from .kutils import FileHandler
 
+from .model_repository import ConfyModelRepository
 
 # TODO add WF as annotiation
 parser = argparse.ArgumentParser(parents=[kserve.model_server.parser])
@@ -14,7 +15,7 @@ parser.add_argument(
     "--workflow",
     type=str,
     required=True,
-    help="A local path to the workflow",
+    help="A local path to the workflow(s) API json file(s)",
 )
 parser.add_argument(
     "--comfyui_path",
@@ -147,14 +148,24 @@ if __name__ == "__main__":
     
     
 
-    workflow = FileHandler.read_json_file(args.workflow)
-    from comfyserver import ComfyModel
-
-    model = ComfyModel(args.model_name, workflow)
+    
     
     try:
-        # model.load()
+        # chekc if workflow is a file or a directory
+        if args.workflow.endswith(".json"):
+            workflow = FileHandler.read_json_file(args.workflow)
+        else:
+            raise ModelMissingError(args.workflow)
+            
+        from comfyserver import ComfyModel
+        model = ComfyModel(args.model_name, workflow)
+        model.load()
         kserve.ModelServer().start([model])
+        # model_server = kserve.ModelServer()
+        # model.load(model_server)
+        # dummy_model = kserve.Model(name="dummy")
+        # dummy_model.load()
+        # model_server.start([dummy_model])
 
     except ModelMissingError:
         logger.error(
@@ -166,6 +177,7 @@ if __name__ == "__main__":
         # Case 2: In the event that the model repository is empty, it's possible that this is a scenario for
         # multi-model serving. In such a case, models are loaded dynamically using the TrainedModel.
         # Therefore, we start the server without any preloaded models
-        # kserve.ModelServer(
-        #     registered_models=SKLearnModelRepository(args.model_dir)
-        # ).start([])
+        kserve.ModelServer()
+        kserve.ModelServer(
+            registered_models=ConfyModelRepository(args.workflow)
+        ).start([])
