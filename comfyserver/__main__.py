@@ -5,12 +5,12 @@ import sys
 import kserve
 from kserve import logging
 from kserve.errors import ModelMissingError
-from kserve.logging import logger
 
 from .kutils import FileHandler, load_extra_path_config
 from .model import ComfyModel
 from .model_repository import ConfyModelRepository
 
+logger = logging.logger
 
 parser = argparse.ArgumentParser(parents=[kserve.model_server.parser])
 parser.add_argument(
@@ -39,6 +39,13 @@ parser.add_argument(
     default=True,
     required=False,
     help="Disables nodes which have a saving functionality",
+)
+parser.add_argument(
+    "--disable_progress_bar",
+    type=bool,
+    default=True,
+    required=False,
+    help="Disables progress bar when sampling",
 )
 parser.add_argument(
     "--override_load_image_nodes",
@@ -83,7 +90,7 @@ def disable_save_nodes(node_class_mapping: dict):
     Disables nodes which have a saving functionality.
     :param flags: The flags to disable save nodes.
     """
-
+    logger.info("Disabling save nodes")
     @classmethod
     def INPUT_TYPES(s):
         return {"required": {}}
@@ -98,39 +105,55 @@ def disable_save_nodes(node_class_mapping: dict):
             # setattr(node_class, "RETURN_TYPES", "IGNORE")
 
 def override_load_image_nodes(node_class_mapping: dict):
+    logger.info("Overriding load image nodes")
     from .overridden_nodes import LoadImage, LoadImageMask
     node_class_mapping["LoadImage"] = LoadImage
     node_class_mapping["LoadImageMask"] = LoadImageMask
 
 
 if __name__ == "__main__":
-    # Init them and get their path from args
     if args.configure_logging:
         logging.configure_logging(args.log_config_file)
+    
+    if args.disable_progress_bar:
+        import comfy.utils
+        comfy.utils.PROGRESS_BAR_ENABLED=False
         
     # TODO fix this cause the pyton path is also set
+    logger.info(f"Adding ComfyUI path to sys.path: {args.comfyui_path}")
     sys.path.insert(0, args.comfyui_path)
     from nodes import NODE_CLASS_MAPPINGS
 
     # TODO error handling
     # TODO add extra flags for custom nodes paths or handle them here
+    logger.info(f"Loading extra path config: {args.models_path_config}")
     load_extra_path_config(args.models_path_config)
 
     if args.override_prompt_server:
+        logger.info("Overriding PromptServer with dummy implementation")
         import server
+
         from .kutils import DummyObject
         server.PromptServer = DummyObject
 
     # Initialize the event loop for loading builtin extra nodes
     if args.enable_extra_builtin_nodes:
+        logger.debug("Initializing extra builtin nodes")
         from nodes import init_extra_nodes
         loop = asyncio.new_event_loop()
-        loop.run_until_complete(
-            init_extra_nodes(
-                init_custom_nodes=args.enable_custom_nodes,
-                init_api_nodes=args.enable_api_nodes,
+        try:
+            loop.run_until_complete(
+                init_extra_nodes(
+                    init_custom_nodes=args.enable_custom_nodes,
+                    init_api_nodes=args.enable_api_nodes,
+                )
             )
-        )
+            logger.info(f"Extra nodes initialized - Custom: {args.enable_custom_nodes}, API: {args.enable_api_nodes}")
+        except Exception as e:
+            logger.error(f"Failed to initialize extra nodes: {str(e)}")
+            raise
+        finally:
+            loop.close()
 
     if args.disable_save_nodes:
         disable_save_nodes(NODE_CLASS_MAPPINGS)
@@ -142,18 +165,23 @@ if __name__ == "__main__":
     try:
         # Check if workflow is a file or a directory
         if args.workflow.endswith(".json"):
+            logger.debug(f"Loading single workflow {args.workflow} as {args.model_name}")
             workflow = FileHandler.read_json_file(args.workflow)
+            model = ComfyModel(args.model_name, workflow)
+            
+            if not model.load():
+                logger.error(f"Failed to load workflow {workflow} as {args.model_name}")
+                raise RuntimeError(f"Model loading failed")
+                
+            logger.info(f"Starting KServe server with single workflow {args.workflow} as {args.model_name}")
+            kserve.ModelServer().start([model])
         else:
             raise ModelMissingError(args.workflow)
-            
-        model = ComfyModel(args.model_name, workflow)
-        model.load()
-        kserve.ModelServer().start([model])
 
 
     except ModelMissingError:
         logger.info(
-            f"No workflow .json file for model {args.model_name} under dir {args.workflow} detected,"
+            f"No single workflow file for model {args.model_name} under dir {args.workflow} detected,"
             f"trying loading from model repository."
         )
         # TODO Model mesh section

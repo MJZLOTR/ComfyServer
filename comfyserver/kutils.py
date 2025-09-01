@@ -27,10 +27,10 @@ def load_extra_path_config(yaml_path):
         
         if is_default:
             # Set default input and output directories if the falg is set
-            folder_paths.output_directory = os.path.join(base_path, "output")
-            folder_paths.temp_directory = os.path.join(base_path, "temp")
-            folder_paths.input_directory = os.path.join(base_path, "input")
-            folder_paths.user_directory = os.path.join(base_path, "user")
+            folder_paths.output_directory = os.path.join(str(base_path), "output")
+            folder_paths.temp_directory = os.path.join(str(base_path), "temp")
+            folder_paths.input_directory = os.path.join(str(base_path), "input")
+            folder_paths.user_directory = os.path.join(str(base_path), "user")
             
         for x in conf:
             for y in conf[x].split("\n"):
@@ -153,7 +153,7 @@ class LoadOrderDeterminer:
         self.load_order = []
         self.is_special_function = False
 
-    def determine_load_order(self) -> List[Tuple[str, Dict, bool]]:
+    def determine_load_order(self) -> Tuple[List,List,List]:
         """Determine the load order for the given data.
 
         Returns:

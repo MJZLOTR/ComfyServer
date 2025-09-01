@@ -3,6 +3,7 @@ from typing import Any, Dict, List, Optional, Tuple, Union
 import numpy as np
 from comfy.comfy_types import IO
 from kserve import InferInput, InferOutput, InferRequest, InferResponse
+from kserve.logging import logger,trace_logger
 from nodes import NODE_CLASS_MAPPINGS
 
 from .kutils import get_value_at_index
@@ -105,6 +106,7 @@ class ComfyKserveMapper:
         elif isinstance(input_spec, str):
             return input_spec
         else:
+            logger.warning(f"Unknown input spec format: {input_spec}, using fallback")
             return IO.ANY  # Default fallback
 
     @classmethod
@@ -122,7 +124,9 @@ class ComfyKserveMapper:
         """
         node_class = NODE_CLASS_MAPPINGS.get(class_type)
         if node_class is None:
-            raise KeyError(f"Unknown node class type: {class_type}")
+            error_msg = f"Unknown node class type: {class_type}"
+            logger.error(error_msg)
+            raise KeyError(error_msg)
 
         # Get input types
         input_types_func = getattr(node_class, "INPUT_TYPES", None)
@@ -137,8 +141,10 @@ class ComfyKserveMapper:
                     input_required_types[input_name] = (
                         cls._extract_type_from_input_spec(input_spec)
                     )
+                
+                
             except Exception as e:
-                print(f"Error extracting input types for {class_type}: {e}")
+                logger.error(f"Error extracting input types for {class_type}: {e}")
 
         # Get output types
         output_types = getattr(node_class, "RETURN_TYPES", ())
@@ -158,6 +164,8 @@ class ComfyKserveMapper:
         Returns:
             Tuple of (infer_inputs, infer_outputs)
         """
+        logger.debug(f"Converting workflow with {len(workflow)} nodes to inference objects")
+        
         infer_inputs = []
         infer_outputs = []
 
@@ -171,10 +179,10 @@ class ComfyKserveMapper:
                     class_type
                 )
             except KeyError as e:
-                print(f"Warning: {e}, skipping node {node_id}")
+                logger.warning(f"Skipping unknown node class {class_type} (ID: {node_id})")
                 continue
             except Exception as e:
-                print(f"Error processing node {class_type} (ID: {node_id}): {e}")
+                logger.error(f"Error processing node {class_type} (ID: {node_id}): {e}")
                 continue
 
             if node_class.CATEGORY == "loaders":
@@ -196,9 +204,6 @@ class ComfyKserveMapper:
                 input_type = input_types.get(input_name, IO.ANY)
 
                 if input_type in cls._IGNORE_TYPES:
-                    print(
-                        f"Skipping ignored input type: {input_type} for input {input_name} in node {node_id}"
-                    )
                     continue
 
                 # Convert to KServe data type
@@ -219,12 +224,11 @@ class ComfyKserveMapper:
 
                 infer_inputs.append(infer_input)
 
+
             # Process outputs
             for idx, output_type in enumerate(output_types):
                 if output_type in cls._IGNORE_TYPES:
-                    print(
-                        f"Skipping ignored output type: {output_type} for node {node_id}"
-                    )
+                    logger.debug(f"Skipping ignored output type: {output_type} for node {node_id}")
                     continue
 
                 # Convert to KServe data type
@@ -241,7 +245,8 @@ class ComfyKserveMapper:
                 )
 
                 infer_outputs.append(infer_output)
-
+                
+        logger.debug(f"Workflow conversion completed: {len(infer_inputs)} inputs, {len(infer_outputs)} outputs")
         return infer_inputs, infer_outputs
 
     @classmethod
@@ -262,6 +267,8 @@ class ComfyKserveMapper:
             data: [b'test'], shape: [1] => 'test'
             data: numpy_array, shape: [H,W,C] => numpy_array
         """
+        trace_logger.debug(f"Converting InferInput {infer_input} to ComfyUI format")
+        
         data = infer_input.as_numpy()
         shape = infer_input.shape
 
@@ -286,9 +293,9 @@ class ComfyKserveMapper:
                 try:
                     np_array = np_array.reshape(shape)
                 except Exception as e:
-                    raise ValueError(
-                        f"Cannot reshape data from shape {np_array.shape} to expected shape {shape}: {e}"
-                    )
+                    error_msg = f"Cannot reshape data from shape {np_array.shape} to expected shape {shape}: {e}"
+                    trace_logger.error(error_msg)
+                    raise ValueError(error_msg)
             return np_array
 
         # Fallback: return raw data
@@ -309,6 +316,10 @@ class ComfyKserveMapper:
         Returns:
             List of InferOutput objects with actual data matching the expected specifications
         """
+        
+        trace_logger.debug("Generating inference response outputs")
+        
+        
         response_outputs = []
 
         # Get requested outputs from payload, or use all if none specified
@@ -334,6 +345,7 @@ class ComfyKserveMapper:
             # output_type = output_spec.parameters.get("output_type")
 
             if node_id is None or output_index is None or output_type is None:
+                trace_logger.warning(f"Invalid output specification: {output_spec.name}")
                 continue
 
             # Get the actual result data from workflow execution
@@ -360,7 +372,7 @@ class ComfyKserveMapper:
                 )
 
                 # Set the actual data
-                # response_output.data = converted_data.tolist() if hasattr(converted_data, 'tolist') else [converted_data]
+                # TODO use set_data_from_numpy for datas which are np array
                 response_output.data = converted_data
                 response_outputs.append(response_output)
 
