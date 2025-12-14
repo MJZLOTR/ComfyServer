@@ -185,7 +185,7 @@ This demo uses the simple Stable Diffusion 1.5 text-to-image workflow.
      --enable_docs_url true \
      --model_name "simple-workflow" \
      --models_path_config /mnt/models/models_path_config.yaml \
-     --workflow /mnt/models/testing/workflows/basic/simple_wf.json \
+     --workflow /mnt/models/workflows/basic/simple_wf.json/basic/simple_wf.json \
      --disable_save_nodes true \
      --enable_extra_builtin_nodes true \
      --enable_custom_nodes true \
@@ -260,7 +260,7 @@ See the [OmniGen2 Examples](https://comfyanonymous.github.io/ComfyUI_examples/om
      --enable_docs_url true \
      --model_name "image_omnigen2_image_edit" \
      --models_path_config /mnt/models/models_path_config.yaml \
-     --workflow /mnt/models/testing/workflows/etc/image_omnigen2_image_edit.json \
+     --workflow /mnt/models/workflows/basic/simple_wf.json/etc/image_omnigen2_image_edit.json \
      --disable_save_nodes true \
      --enable_extra_builtin_nodes true \
      --enable_custom_nodes true \

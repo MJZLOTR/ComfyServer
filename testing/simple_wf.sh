@@ -32,7 +32,7 @@ EOM
 
 # Make the API call using the temp file
 curl -H "Content-Type: application/json" \
-     http://localhost:8000/v2/models/simple-workflow/infer \
+     http://localhost:8080/v2/models/simple-workflow/infer \
      -d @"$TEMP_JSON" | jq -r '.outputs[0].data[0]' > "$TEMP_IMG"
      
 cat "$TEMP_IMG" | base64 -d > generated_image_curl.png
