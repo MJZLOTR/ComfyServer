@@ -328,7 +328,7 @@ The script demonstrates how to:
 
 ## Workflow Templates
 
-The `testing/workflows/` directory contains example workflows. All workflows have been tested in ComfyUI before being exported for use with ComfyServer.
+The `testing/workflows/` directory contains example workflows. All workflows have been tested with ComfyServer.
 
 | Workflow | Description | ComfyUI Template |
 |----------|-------------|------------------|
