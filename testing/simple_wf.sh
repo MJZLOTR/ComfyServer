@@ -12,7 +12,7 @@ cat > "$TEMP_JSON" << EOM
   "id" : "1",
   "inputs" : [
         {"name":"3_steps","datatype":"INT32","shape":[1],"data":[10]},
-        {"name":"6_text","datatype":"BYTES","shape":[1],"data":["image prompt"]}
+        {"name":"6_text","datatype":"BYTES","shape":[1],"data":["montains over the city"]}
   ],
    "outputs" : [
     {

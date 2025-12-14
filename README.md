@@ -70,7 +70,7 @@ Download the required model files for your workflow from [Hugging Face](https://
 
 #### Create Config File
 
-Create a `config.yaml` file to map model paths (see [config_example.yaml](config_example.yaml)):
+Create a `config.yaml` file to map model paths (see [models_path_config.yaml](./testing/models_path_config.yaml)):
 
 ```yaml
 comfyui:
@@ -234,17 +234,112 @@ The inference request follows the Open Inference Protocol V2 format. Input/outpu
 - **Inputs**: `{node_id}_{input_name}` (e.g., `6_text` for node 6's text input)
 - **Outputs**: `{node_id}_{output_index}_{type}` (e.g., `8_0_IMAGE` for node 8's first IMAGE output)
 
+## Demo: Image Input with Base64
+
+This demo shows how to send images in your inference requests using base64 encoding. This is useful for image-to-image workflows, image editing, and other use cases that require input images.
+
+See the [OmniGen2 Examples](https://comfyanonymous.github.io/ComfyUI_examples/omnigen/) for workflow references.
+
+### Setup
+
+1. **Prepare the Docker image** and **download the OmniGen2 model** following the model setup instructions above.
+
+2. **Start the server** with the OmniGen2 image editing workflow:
+   ```bash
+   docker run -it --rm \
+     -e PORT=8080 \
+     -p 8080:8080 \
+     --gpus all \
+     -v "$(pwd)/testing":/mnt/models \
+     comfyserver \
+     --http_port 8080 \
+     --enable_grpc false \
+     --predictor_protocol v2 \
+     --workers 1 \
+     --max_threads 4 \
+     --enable_docs_url true \
+     --model_name "image_omnigen2_image_edit" \
+     --models_path_config /mnt/models/models_path_config.yaml \
+     --workflow /mnt/models/testing/workflows/etc/image_omnigen2_image_edit.json \
+     --disable_save_nodes true \
+     --enable_extra_builtin_nodes true \
+     --enable_custom_nodes true \
+     --enable_api_nodes false
+   ```
+
+### Send an Image via Base64
+
+Use the provided test script:
+
+```bash
+./testing/omni_edit_request.sh
+```
+
+The script demonstrates how to:
+
+1. **Encode an image to base64**:
+   ```bash
+   IMAGE_B64=$(base64 -w 0 "./your_image.png")
+   ```
+
+2. **Include the base64 image in the request** with `as_base64: true` parameter:
+   ```bash
+   curl -X POST http://localhost:8080/v2/models/image_omnigen2_image_edit/infer \
+     -H "Content-Type: application/json" \
+     -d '{
+       "id": "1",
+       "inputs": [
+         {
+           "name": "6_text",
+           "datatype": "BYTES",
+           "shape": [1],
+           "data": ["your prompt describing the edit"]
+         },
+         {
+           "name": "16_image",
+           "datatype": "BYTES",
+           "shape": [1],
+           "data": ["'"$IMAGE_B64"'"],
+           "parameters": {
+             "as_base64": true
+           }
+         }
+       ],
+       "outputs": [
+         {
+           "name": "8_0_IMAGE",
+           "datatype": "FP32",
+           "shape": [-1],
+           "parameters": {
+             "binary_data": false,
+             "to_base64": true
+           }
+         }
+       ]
+     }' | jq -r '.outputs[0].data[0]' | base64 -d > generated_image.png
+   ```
+
+### Key Parameters
+
+| Parameter | Description |
+|-----------|-------------|
+| `as_base64: true` | Indicates the input data is base64-encoded |
+| `to_base64: true` | Returns output image as base64 (in response) |
+
 ## Workflow Templates
 
-The `testing/workflows/` directory contains example workflows:
+The `testing/workflows/` directory contains example workflows. All workflows have been tested in ComfyUI before being exported for use with ComfyServer.
 
-| Workflow | Description |
-|----------|-------------|
-| `basic/simple_wf.json` | Basic text-to-image with SD 1.5 |
-| `basic/image2image.json` | Image-to-image transformation |
-| `basic/lora.json` | LoRA model usage |
-| `basic/inpaint_example.json` | Inpainting workflow |
-| `flux/` | FLUX model workflows |
+| Workflow | Description | ComfyUI Template |
+|----------|-------------|------------------|
+| `basic/simple_wf.json` | Basic text-to-image with SD 1.5 | — |
+| `basic/image2image.json` | Image-to-image transformation | [Image-to-Image](https://comfyanonymous.github.io/ComfyUI_examples/img2img/) |
+| `basic/lora.json` | LoRA model usage | [LoRA Example](https://comfyanonymous.github.io/ComfyUI_examples/lora/) |
+| `basic/inpaint_example.json` | Inpainting workflow | [Inpaint Example](https://comfyanonymous.github.io/ComfyUI_examples/inpaint/) |
+| `flux/` | FLUX model workflows | [FLUX Examples](https://comfyanonymous.github.io/ComfyUI_examples/flux/) |
+| `etc/image_qwen_image.json` | Qwen2.5-VL text-to-image | [Qwen Image Gen](https://comfyanonymous.github.io/ComfyUI_examples/qwen_image/) |
+| `etc/image_omnigen2_t2i.json` | OmniGen2 text-to-image | [OmniGen2 Examples](https://comfyanonymous.github.io/ComfyUI_examples/omnigen/) |
+| `etc/image_omnigen2_image_edit.json` | OmniGen2 image editing with reference | [OmniGen2 Examples](https://comfyanonymous.github.io/ComfyUI_examples/omnigen/) |
 
 ## Architecture
 
@@ -303,6 +398,3 @@ python -m comfyserver \
   --enable_docs_url true
 ```
 
-## License
-
-See [LICENSE](LICENSE) for details.
