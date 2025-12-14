@@ -51,6 +51,7 @@ class ConfyModelRepository(ModelRepository):
                     return results
                 except Exception as e:
                     logger.error(f"Error during model loading: {str(e)}")
+                    raise e
                 finally:
                     loop.close()
             

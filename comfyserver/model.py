@@ -8,7 +8,7 @@ import torch
 from kserve import Model
 from kserve.errors import InvalidInput
 from kserve.logging import logger, trace_logger
-from kserve.protocol.infer_type import InferRequest, InferResponse
+from kserve.protocol.infer_type import InferRequest, InferResponse, InferOutput
 from nodes import NODE_CLASS_MAPPINGS
 
 from .adaptor import ComfyKserveMapper
@@ -28,7 +28,6 @@ class ComfyModel(Model):
         self._loader_outputs: dict[str, Any] = {}  # <- cached results
         self.gpu_semaphore = asyncio.Semaphore()
 
-        
         logger.info(f"Initializing Comfy Model {name}")
 
         load_order_determiner = LoadOrderDeterminer(workflow, NODE_CLASS_MAPPINGS)
@@ -42,8 +41,10 @@ class ComfyModel(Model):
         # Save input and output names for quick validation
         self.input_names = [inp.name for inp in self.infer_inputs]
         self.output_names = [out.name for out in self.infer_outputs]
-        logger.debug(f"{name} initialized with {self.input_names} as inputs and {self.output_names} as outputs")
-        
+        logger.debug(
+            f"{name} initialized with {self.input_names} as inputs and {self.output_names} as outputs"
+        )
+
     @staticmethod
     def _grabage_collect():
         # TODO: research if this is really necessary here or if it can be done better
@@ -74,9 +75,9 @@ class ComfyModel(Model):
 
         initialized_objects = {}
         cache_dict = {}
-        
+
         init_order, _, _ = self.orders
-        
+
         with torch.no_grad():
             for idx, data, _ in init_order:
                 cache_dict[idx] = {}
@@ -104,18 +105,21 @@ class ComfyModel(Model):
                         node_config["class_type"] == cls_name
                         and node_config["inputs"] == inputs
                     ):
-                        logger.debug(f"Reusing loader node {node_id} ({cls_name}) for node {idx} with same inputs {inputs}")
+                        logger.debug(
+                            f"Reusing loader node {node_id} ({cls_name}) for node {idx} with same inputs {inputs}"
+                        )
                         output = self._loader_outputs[node_id]
                         break
 
                 if not output:
-                    logger.debug(f"Executing loader node {idx} ({cls_name}) with inputs {inputs}")
+                    logger.debug(
+                        f"Executing loader node {idx} ({cls_name}) with inputs {inputs}"
+                    )
                     output = getattr(obj, obj.FUNCTION)(**inputs)
 
                 # run and cache
                 self._loader_outputs[idx] = output
-               
-                
+
         self.ready = True
         logger.info(f"{len(self._loader_outputs)} Loader nodes created for {self.name}")
         return self.ready
@@ -124,7 +128,7 @@ class ComfyModel(Model):
         self, payload: InferRequest, headers: Dict[str, str] = None
     ) -> InferRequest:
         trace_logger.info(f"Preprocessing request for model {self.name}")
-        
+
         for infer_input in payload.inputs:
             if infer_input.name not in self.input_names:
                 raise InvalidInput(
@@ -137,7 +141,7 @@ class ComfyModel(Model):
                     raise InvalidInput(
                         f"Output {infer_output.name} not found in model outputs."
                     )
-        
+
         return payload
 
     async def postprocess(
@@ -158,6 +162,19 @@ class ComfyModel(Model):
         """
         trace_logger.info(f"Postprocessing request for model {self.name}")
 
+        for idx, infer_out in enumerate(result.outputs):
+            if infer_out.parameters and infer_out.parameters.get("to_base64"):
+                result.outputs[idx] = ComfyKserveMapper.convert_image_to_base64(
+                    infer_out
+                )
+
+            if infer_out.parameters and infer_out.parameters.get("rename"):
+                new_name = infer_out.parameters.get("rename")
+                result.outputs[idx]._parameters["original_name"]=infer_out.name
+                result.outputs[idx]._name = new_name
+                result._requested_outputs[idx]._name = new_name
+                
+
         # TODO inplement output name relabeling here based on parameters in InferResponse comming from InferRequest in predict
         return result
 
@@ -165,29 +182,32 @@ class ComfyModel(Model):
         self, payload: InferRequest, headers: Dict[str, str] = None
     ) -> Union[InferResponse, asyncio.Task]:
         trace_logger.info(f"Prediction request for model {self.name}")
-        
+
         async with self.gpu_semaphore:
             try:
                 return await asyncio.to_thread(
                     self._infer, payload=payload, headers=headers
                 )
             except Exception as e:
-                trace_logger.error(f"Inference request {payload} with headers {headers} for model {self.name} failed:  {str(e)}")
+                trace_logger.error(
+                    f"Inference request {payload} with headers {headers} for model {self.name} failed:  {str(e)}"
+                )
                 raise e
             finally:
                 self._grabage_collect()
+
     def _infer(
         self, payload: InferRequest, headers: Dict[str, str] = None
     ) -> InferResponse:
         """Execute the workflow directly and return results."""
         trace_logger.debug("Executing workflow")
-        
+
         _, runtime_order, _ = self.orders
 
         # Store initialized objects and executed variables
         initialized_objects = {}
         current_results = {}
-        
+
         device = torch.cuda.current_device()
         with torch.cuda.device(device):
             with torch.no_grad():
@@ -208,7 +228,9 @@ class ComfyModel(Model):
                     # prompt_input = prompt_input.get('inputs')
 
                     if missing_required_variable:
-                        trace_logger.warning(f"Skipping node {idx} ({class_type}) - missing required inputs")
+                        trace_logger.warning(
+                            f"Skipping node {idx} ({class_type}) - missing required inputs"
+                        )
                         continue
 
                     # Skip preview image nodes
@@ -218,9 +240,11 @@ class ComfyModel(Model):
 
                     # Initialize the class if not already done
                     if class_type not in initialized_objects:
-                        initialized_objects[class_type] = NODE_CLASS_MAPPINGS[class_type]()
+                        initialized_objects[class_type] = NODE_CLASS_MAPPINGS[
+                            class_type
+                        ]()
                         trace_logger.debug(f"Initialized {class_type}")
-                        
+
                     class_instance = initialized_objects[class_type]
 
                     # Prepare inputs for execution
@@ -235,9 +259,11 @@ class ComfyModel(Model):
                                     executed_variables[node_id], output_index
                                 )
                             else:
-                                trace_logger.warning(f"Referenced node {node_id} not found in executed variables")
+                                trace_logger.warning(
+                                    f"Referenced node {node_id} not found in executed variables"
+                                )
                                 processed_inputs[key] = value
-                                
+
                         elif user_input := payload.get_input_by_name(
                             ComfyKserveMapper.INFER_INPUT_NAME_TEMPLATE.format(
                                 node_id=idx, input_name=key
@@ -249,16 +275,19 @@ class ComfyModel(Model):
                                     user_input
                                 )
                             )
-                            trace_logger.debug(f"Using user input for {key} in node {idx}")
+                            trace_logger.debug(
+                                f"Using user input for {key} in node {idx}"
+                            )
 
                         elif key in ["noise_seed", "seed"]:
                             # Generate random seed
                             processed_inputs[key] = random.randint(1, 2**64)
-                            trace_logger.debug(f"Generated random seed for {key}: {processed_inputs[key]}")
-                            
+                            trace_logger.debug(
+                                f"Generated random seed for {key}: {processed_inputs[key]}"
+                            )
+
                         else:
                             processed_inputs[key] = value
-
 
                     # Add hidden variables if needed
                     if (
@@ -291,10 +320,14 @@ class ComfyModel(Model):
                             **processed_inputs
                         )
                         current_results[idx] = result
-                        trace_logger.debug(f"Executed node {idx} ({class_type}) successfully")
+                        trace_logger.debug(
+                            f"Executed node {idx} ({class_type}) successfully"
+                        )
 
                     except Exception as e:
-                        trace_logger.error(f"Error executing node {idx} ({class_type}): {str(e)}")
+                        trace_logger.exception(
+                            f"Error executing node {idx} ({class_type}): {str(e)}"
+                        )
                         current_results[idx] = None
 
             # Create response outputs with actual data
@@ -308,7 +341,9 @@ class ComfyModel(Model):
             response_id=str(payload.id),
             model_name=self.name,
             infer_outputs=response_outputs,
-            parameters={"execution_successful": True},
+            requested_outputs=payload.request_outputs,
+            use_binary_outputs=payload.use_binary_outputs if not payload.from_grpc else None,
+            parameters={"execution_successful": True, **(payload.parameters if payload.parameters else {})},
         )
 
     def _process_inputs(self, inputs: Dict, executed_variables: Dict) -> Dict:
@@ -325,7 +360,9 @@ class ComfyModel(Model):
                         executed_variables[node_id], output_index
                     )
                 else:
-                    logger.warning(f"Referenced node {node_id} not found in executed variables")
+                    logger.warning(
+                        f"Referenced node {node_id} not found in executed variables"
+                    )
                     processed_inputs[key] = value
             # TODO insert input replacement logic here
             elif key in ["noise_seed", "seed"]:

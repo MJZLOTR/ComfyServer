@@ -1,10 +1,13 @@
+import base64
+import io
 from typing import Any, Dict, List, Optional, Tuple, Union
 
 import numpy as np
 from comfy.comfy_types import IO
 from kserve import InferInput, InferOutput, InferRequest, InferResponse
-from kserve.logging import logger,trace_logger
+from kserve.logging import logger, trace_logger
 from nodes import NODE_CLASS_MAPPINGS
+from PIL import Image
 
 from .kutils import get_value_at_index
 
@@ -145,6 +148,7 @@ class ComfyKserveMapper:
                 
             except Exception as e:
                 logger.error(f"Error extracting input types for {class_type}: {e}")
+                raise e
 
         # Get output types
         output_types = getattr(node_class, "RETURN_TYPES", ())
@@ -188,6 +192,7 @@ class ComfyKserveMapper:
             if node_class.CATEGORY == "loaders":
                 continue
 
+            # TODO make a costants py for all constans
             node_metadata = {
                 "node_id": node_id,
                 "node_title": node_data.get("_meta", {}).get("title", ""),
@@ -227,8 +232,12 @@ class ComfyKserveMapper:
 
             # Process outputs
             for idx, output_type in enumerate(output_types):
-                if output_type in cls._IGNORE_TYPES:
-                    logger.debug(f"Skipping ignored output type: {output_type} for node {node_id}")
+                try:
+                    if output_type in cls._IGNORE_TYPES:
+                        logger.debug(f"Skipping ignored output type: {output_type} for node {node_id}")
+                        continue
+                except Exception as e:
+                    logger.debug(f"Skipping output type: {output_type} for node {node_id} because {e}")
                     continue
 
                 # Convert to KServe data type
@@ -241,7 +250,7 @@ class ComfyKserveMapper:
                     ),
                     shape=shape,
                     datatype=kserve_dtype,
-                    parameters={"output_index": idx, **node_metadata},
+                    parameters={"output_index": idx,"output_type":output_type, **node_metadata},
                 )
 
                 infer_outputs.append(infer_output)
@@ -271,6 +280,10 @@ class ComfyKserveMapper:
         
         data = infer_input.as_numpy()
         shape = infer_input.shape
+        as_base64 = infer_input.parameters.get("as_base64",False) if infer_input.parameters else False
+        
+        if as_base64:
+            return data
 
         # Handle scalar values (including bytes that need decoding)
         if shape == [1]:
@@ -319,24 +332,18 @@ class ComfyKserveMapper:
         
         trace_logger.debug("Generating inference response outputs")
         
+        supported_outputs = {
+            output_spec.name:output_spec for output_spec in infer_outputs
+        }
         
         response_outputs = []
-
-        # Get requested outputs from payload, or use all if none specified
-        requested_output_names = []
-        if infer_request.request_outputs:
-            requested_output_names = [
-                req_out.name for req_out in infer_request.request_outputs
-            ]
-        else:
-            return response_outputs
-            # requested_output_names = [out.name for out in cls.infer_outputs]
-
-        for output_spec in infer_outputs:
-            # Skip if this output wasn't requested
-            if output_spec.name not in requested_output_names:
+        
+        for requested_output in infer_request.request_outputs:
+            if requested_output.name not in supported_outputs.keys():
                 continue
 
+            output_spec = supported_outputs.get(requested_output.name)
+            
             node_id, output_index, output_type = output_spec.name.split("_", 2)
             # TODO add two options for specifying output nme
 
@@ -345,7 +352,7 @@ class ComfyKserveMapper:
             # output_type = output_spec.parameters.get("output_type")
 
             if node_id is None or output_index is None or output_type is None:
-                trace_logger.warning(f"Invalid output specification: {output_spec.name}")
+                trace_logger.warning(f"Invalid output specification: {requested_output.name}")
                 continue
 
             # Get the actual result data from workflow execution
@@ -367,14 +374,16 @@ class ComfyKserveMapper:
                         if hasattr(converted_data, "shape")
                         else output_spec.shape
                     ),
+                    
                     datatype=output_spec.datatype,
-                    parameters=output_spec.parameters,
+                    parameters={**(requested_output.parameters if requested_output.parameters else {}),**(output_spec.parameters if output_spec.parameters else {})},
                 )
 
                 # Set the actual data
                 # TODO use set_data_from_numpy for datas which are np array
                 response_output.data = converted_data
                 response_outputs.append(response_output)
+            
 
         return response_outputs
 
@@ -444,3 +453,47 @@ class ComfyKserveMapper:
             except:
                 return data
 
+
+    @classmethod
+    def convert_image_to_base64(cls,infer_out:InferOutput, format='PNG') -> InferOutput:
+        # Extract single image from batch [1, 512, 512, 3] -> [512, 512, 3]
+        
+        if infer_out.parameters and not infer_out.parameters.get("output_type","") == IO.IMAGE:
+            return infer_out
+        
+        tensor = infer_out.as_numpy()
+        
+        batch_size = tensor.shape[0]
+        base64_images = []
+    
+        for i in range(batch_size):
+            # Extract single image from batch
+            image_array = tensor[i]
+            
+            # Normalize values to 0-255 range and convert to uint8
+            if image_array.max() <= 1.0:
+                image_array = (image_array * 255).astype(np.uint8)
+            else:
+                image_array = np.clip(image_array, 0, 255).astype(np.uint8)
+            
+            # Convert to PIL Image
+            image = Image.fromarray(image_array)
+            
+            # Convert to bytes in specified format
+            buffer = io.BytesIO()
+            image.save(buffer, format=format)
+            image_bytes = buffer.getvalue()
+            
+            # Encode to base64
+            base64_str = base64.b64encode(image_bytes).decode('utf-8')
+            base64_images.append(base64_str)
+        
+        # Create InferOutput
+        return InferOutput(
+            name=infer_out.name,
+            shape=[batch_size],  # One base64 string per image
+            datatype="BYTES",
+            data=base64_images,
+            parameters=infer_out.parameters
+        )
+    

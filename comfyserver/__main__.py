@@ -1,6 +1,7 @@
 import argparse
 import asyncio
 import sys
+import os
 
 import kserve
 from kserve import logging
@@ -20,9 +21,10 @@ parser.add_argument(
     help="A local path to the workflow(s) API json file(s)",
 )
 parser.add_argument(
-    "--comfyui_path",
+    "--comfy_path",
     type=str,
-    required=True,
+    default=None,
+    required=False,
     help="A local path to the ComfyUI directory",
 )
 parser.add_argument(
@@ -111,6 +113,8 @@ def override_load_image_nodes(node_class_mapping: dict):
     node_class_mapping["LoadImageMask"] = LoadImageMask
 
 
+
+# TODO change all log.error to log.exception
 if __name__ == "__main__":
     if args.configure_logging:
         logging.configure_logging(args.log_config_file)
@@ -120,8 +124,15 @@ if __name__ == "__main__":
         comfy.utils.PROGRESS_BAR_ENABLED=False
         
     # TODO fix this cause the pyton path is also set
-    logger.info(f"Adding ComfyUI path to sys.path: {args.comfyui_path}")
-    sys.path.insert(0, args.comfyui_path)
+    if args.comfy_path:
+        comfy_path = args.comfy_path
+    elif comfy_path:= os.environ.get("COMFY_PATH",""):
+        pass
+    else:
+        RuntimeError(f"Path to Comfy is not detected either via env or arg") 
+    logger.info(f"Adding ComfyUI path to sys.path: {comfy_path}")
+    sys.path.insert(0, comfy_path)
+    
     from nodes import NODE_CLASS_MAPPINGS
 
     # TODO error handling
@@ -194,5 +205,5 @@ if __name__ == "__main__":
             registered_models=ConfyModelRepository(args.workflow)
         ).start([])
     except Exception as e:
-        logger.error(f"Failed to start the model server: {str(e)}")
+        logger.exception(f"Failed to start the model server: {str(e)}")
         raise e

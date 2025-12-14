@@ -1,12 +1,14 @@
 import json
 import logging
 import os
+import sys
 from typing import Any, Dict, List, Mapping, Sequence, TextIO, Tuple, Union
 
 import folder_paths
 import yaml
 
-
+# TODO loggers nodes
+# TODO Write input and output node path 
 def load_extra_path_config(yaml_path):
     with open(yaml_path, 'r', encoding='utf-8') as stream:
         config = yaml.safe_load(stream)
@@ -16,21 +18,40 @@ def load_extra_path_config(yaml_path):
         if conf is None:
             continue
         base_path = None
+        # custom_nodes_dependency
         if "base_path" in conf:
             base_path = conf.pop("base_path")
             base_path = os.path.expandvars(os.path.expanduser(base_path))
             if not os.path.isabs(base_path):
                 base_path = os.path.abspath(os.path.join(yaml_dir, base_path))
+        # if "custom_nodes_dependency" in conf:
+        #     custom_nodes_dependency = conf.pop("custom_nodes_dependency")
+        #     custom_nodes_dependency = os.path.expandvars(os.path.expanduser(custom_nodes_dependency))
+        #     if not os.path.isabs(custom_nodes_dependency):
+        #         base_path = os.path.abspath(os.path.join(yaml_dir, custom_nodes_dependency))
+        #     sys.path.insert(-1, custom_nodes_dependency)
         is_default = False
         if "is_default" in conf:
             is_default = conf.pop("is_default")
         
         if is_default:
             # Set default input and output directories if the falg is set
+            folder_paths.models_dir = os.path.join(str(base_path), "models")
             folder_paths.output_directory = os.path.join(str(base_path), "output")
             folder_paths.temp_directory = os.path.join(str(base_path), "temp")
             folder_paths.input_directory = os.path.join(str(base_path), "input")
             folder_paths.user_directory = os.path.join(str(base_path), "user")
+        
+        for dir in ["models","output","temp","input","user"]:
+            dir_name = f"default_{dir}_dir"
+            if dir_name in conf:
+                dir_path = conf.pop(dir_name)
+                if dir == "models":
+                    folder_paths.models_dir = os.path.join(str(base_path), str(dir))
+                else:
+                    setattr(folder_paths,f"{dir}_directory",os.path.join(str(dir_path), ""))            
+        
+
             
         for x in conf:
             for y in conf[x].split("\n"):

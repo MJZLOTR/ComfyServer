@@ -1,7 +1,12 @@
 
 
+import base64
+import io
+
 import nodes
+import numpy as np
 import torch
+from PIL import Image
 
 
 class LoadImage:
@@ -20,14 +25,37 @@ class LoadImage:
             return nodes.LoadImage().load_image(image)
         # Input image is already a tensor with shape (batch, height, width, channels)
         # and values normalized to [0,1] range
+       
+       
+        # Handle numpy array with dtype=object containing base64 encoded images
+        if isinstance(image, np.ndarray) and image.dtype == object:
+            decoded_images = []
+            for img_b64 in image:
+                # Decode base64 image to bytes
+                img_bytes = base64.b64decode(img_b64)
+                # Open image with PIL from bytes
+                pil_img = Image.open(io.BytesIO(img_bytes)).convert('RGBA')
+                # Convert PIL image to numpy array and normalize to [0,1]
+                np_img = np.array(pil_img).astype(np.float32) / 255.0
+                decoded_images.append(np_img)
+            # Stack decoded images along batch dimension
+            image = np.stack(decoded_images, axis=0)
+        
+
+        
+        # # Ensure the image is a torch tensor
+        # if not isinstance(image, torch.Tensor):
+        #     image = torch.from_numpy(image).float()
         
         # Ensure the image is a torch tensor
         if not isinstance(image, torch.Tensor):
-            image = torch.from_numpy(image).float()
+            # Always create a copy to avoid writeable issues
+            image = torch.tensor(image, dtype=torch.float32)
+        else:
+            # Ensure the tensor is float32
+            if image.dtype != torch.float32:
+                image = image.float()
         
-        # Ensure the tensor is float32
-        if image.dtype != torch.float32:
-            image = image.float()
         
         # Get dimensions
         batch_size, h, w, channels = image.shape
