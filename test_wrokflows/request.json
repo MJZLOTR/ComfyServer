@@ -1,0 +1,16 @@
+{
+  "id" : "1",
+  "inputs" : [
+        {"name":"3_steps","datatype":"INT32","shape":[1],"data":[200]}
+  ],
+  "outputs" : [
+    {
+      "name": "8_0_IMAGE",
+      "datatype": "FP32",
+      "shape": [-1],
+      "parameters": {
+        "content_type": "image/png"
+      }
+    }
+  ]
+}

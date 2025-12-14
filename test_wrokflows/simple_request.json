@@ -1,0 +1,15 @@
+{
+  "id" : "1",
+  "inputs" : [
+  ],
+  "outputs" : [
+    {
+      "name": "8_0_IMAGE",
+      "datatype": "FP32",
+      "shape": [-1],
+      "parameters": {
+        "content_type": "image/png"
+      }
+    }
+  ]
+}
