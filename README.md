@@ -165,7 +165,7 @@ This demo uses the simple Stable Diffusion 1.5 text-to-image workflow.
 
 2. **Download the model** (if not already done):
    ```bash
-   cd testing && ./download_models.sh && cd ..
+   ./testing/download_models.s
    ```
 
 3. **Start the server**:
